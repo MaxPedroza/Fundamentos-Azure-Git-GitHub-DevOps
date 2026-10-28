@@ -53,9 +53,16 @@ export const initialWorkouts = [
 export const sampleHistory = [
   { id: 'sample-1', date: '2026-10-25', workoutName: 'Treino A', focus: 'Peito e tríceps', duration: 52, volume: 3820, pain: '' },
   { id: 'sample-2', date: '2026-10-23', workoutName: 'Treino B', focus: 'Costas e bíceps', duration: 58, volume: 4160, pain: '' },
-  { id: 'sample-3', date: '2026-10-21', workoutName: 'Treino C', focus: 'Pernas completas', duration: 63, volume: 6890, pain: 'Leve incômodo no joelho esquerdo' },
+  { id: 'sample-3', date: '2026-10-21', workoutName: 'Treino C', focus: 'Pernas completas', duration: 63, volume: 6890, pain: '' },
 ]
 
 export function formatDate(date) {
   return new Intl.DateTimeFormat('pt-BR', { day: '2-digit', month: 'short' }).format(new Date(`${date}T12:00:00`))
+}
+
+export function localDateString(date = new Date()) {
+  const year = date.getFullYear()
+  const month = String(date.getMonth() + 1).padStart(2, '0')
+  const day = String(date.getDate()).padStart(2, '0')
+  return `${year}-${month}-${day}`
 }

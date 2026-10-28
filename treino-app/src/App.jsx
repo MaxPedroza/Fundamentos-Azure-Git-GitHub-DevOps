@@ -1,14 +1,14 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import {
   Activity, ArrowLeft, ArrowRight, Bell, CalendarDays, Check, CheckCircle2,
   ChevronDown, ChevronRight, CircleHelp, Clock3, Dumbbell, FileImage, Flame, HeartPulse,
   History, LayoutDashboard, LogIn, LogOut, MoreHorizontal, Pause, Play,
   Plus, Settings2, Sparkles, Timer, TrendingUp, Trophy, Upload, X, Zap,
 } from 'lucide-react'
-import { formatDate, initialWorkouts, sampleHistory } from './data'
+import { formatDate, initialWorkouts, localDateString, sampleHistory } from './data'
 import {
   isFirebaseConfigured, loadUserData, saveUserData, signIn, signInWithGoogle,
-  signOutUser, watchAuth,
+  requestWorkoutGeneration, signOutUser, watchAuth,
 } from './firebase'
 import './App.css'
 
@@ -28,15 +28,69 @@ function readSavedData() {
   }
 }
 
+function readUserSavedData(userId) {
+  try {
+    const saved = localStorage.getItem(`${storageKey}-${userId}`)
+    return saved ? JSON.parse(saved) : {}
+  } catch {
+    return {}
+  }
+}
+
+function getWorkoutStreak(history, currentDate) {
+  const dates = new Set(history.map((entry) => entry.date))
+  const cursor = new Date(currentDate)
+  if (!dates.has(localDateString(cursor))) cursor.setDate(cursor.getDate() - 1)
+  let current = 0
+  while (dates.has(localDateString(cursor))) {
+    current += 1
+    cursor.setDate(cursor.getDate() - 1)
+  }
+
+  const orderedDates = [...dates].sort()
+  let best = 0
+  let streak = 0
+  let previousDate = null
+  orderedDates.forEach((date) => {
+    const currentDateValue = new Date(`${date}T00:00:00Z`)
+    const consecutive = previousDate && currentDateValue - previousDate === 86400000
+    streak = consecutive ? streak + 1 : 1
+    best = Math.max(best, streak)
+    previousDate = currentDateValue
+  })
+  return { current, best }
+}
+
+function notifyRestComplete() {
+  if ('vibrate' in navigator) navigator.vibrate([250, 100, 250])
+  try {
+    const audio = new window.AudioContext()
+    const tone = audio.createOscillator()
+    const volume = audio.createGain()
+    volume.gain.setValueAtTime(0.06, audio.currentTime)
+    tone.frequency.value = 880
+    tone.connect(volume)
+    volume.connect(audio.destination)
+    tone.onended = () => audio.close()
+    tone.start()
+    tone.stop(audio.currentTime + 0.25)
+  } catch {
+    return
+  }
+}
+
 function App() {
-  const savedData = useMemo(readSavedData, [])
+  const savedData = useMemo(() => readSavedData(), [])
+  const [currentDate] = useState(() => new Date())
   const [workouts, setWorkouts] = useState(savedData.workouts ?? initialWorkouts)
   const [history, setHistory] = useState(savedData.history ?? sampleHistory)
   const [activePage, setActivePage] = useState('home')
   const [selectedWorkoutId, setSelectedWorkoutId] = useState('a')
   const [activeWorkoutId, setActiveWorkoutId] = useState(null)
   const [completedSets, setCompletedSets] = useState({})
+  const [sessionLoads, setSessionLoads] = useState({})
   const [restSeconds, setRestSeconds] = useState(0)
+  const restSecondsRef = useRef(restSeconds)
   const [timerRunning, setTimerRunning] = useState(false)
   const [restDuration, setRestDuration] = useState(90)
   const [sessionStarted, setSessionStarted] = useState(null)
@@ -51,6 +105,7 @@ function App() {
   const [authError, setAuthError] = useState('')
   const [user, setUser] = useState(null)
   const [cloudReady, setCloudReady] = useState(false)
+  const [canSyncCloud, setCanSyncCloud] = useState(false)
   const [notice, setNotice] = useState('')
   const [aiInput, setAiInput] = useState('')
   const [aiImage, setAiImage] = useState(null)
@@ -60,52 +115,82 @@ function App() {
 
   const selectedWorkout = workouts.find((workout) => workout.id === selectedWorkoutId) ?? workouts[0]
   const activeWorkout = workouts.find((workout) => workout.id === activeWorkoutId)
-  const completedCount = history.filter((entry) => !entry.id.startsWith('sample-')).length
+  const completedCount = history.length
   const latestWorkout = history[0]
 
   useEffect(() => {
+    let latestRequest = 0
+    let activeUserId = null
     const unsubscribe = watchAuth(async (nextUser) => {
+      const requestId = ++latestRequest
+      const previousUserId = activeUserId
+      activeUserId = nextUser?.uid ?? null
       setUser(nextUser)
       setCloudReady(false)
+      setCanSyncCloud(false)
       if (!nextUser) {
+        if (previousUserId) {
+          setWorkouts(initialWorkouts)
+          setHistory(sampleHistory)
+        }
         setCloudReady(true)
         return
       }
+      if (previousUserId && previousUserId !== nextUser.uid) {
+        setWorkouts(initialWorkouts)
+        setHistory(sampleHistory)
+      }
       try {
         const cloudData = await loadUserData(nextUser.uid)
-        if (cloudData?.workouts) setWorkouts(cloudData.workouts)
-        if (cloudData?.history) setHistory(cloudData.history)
+        if (requestId !== latestRequest) return
+        const accountData = { ...readUserSavedData(nextUser.uid), ...cloudData }
+        if (accountData.workouts) setWorkouts(accountData.workouts)
+        else if (previousUserId) setWorkouts(initialWorkouts)
+        if (accountData.history) setHistory(accountData.history)
+        else if (previousUserId) setHistory(sampleHistory)
+        setCanSyncCloud(true)
       } catch {
+        if (requestId !== latestRequest) return
         setNotice('Não foi possível sincronizar agora. Seus dados continuam salvos neste dispositivo.')
       } finally {
-        setCloudReady(true)
+        if (requestId === latestRequest) setCloudReady(true)
       }
     })
-    return unsubscribe
+    return () => {
+      latestRequest += 1
+      unsubscribe()
+    }
   }, [])
 
   useEffect(() => {
     const data = { workouts, history }
-    localStorage.setItem(storageKey, JSON.stringify(data))
-    if (user && cloudReady) {
+    const localKey = user ? `${storageKey}-${user.uid}` : storageKey
+    localStorage.setItem(localKey, JSON.stringify(data))
+    if (user && cloudReady && canSyncCloud) {
       saveUserData(user.uid, data).catch(() => {
+        setCanSyncCloud(false)
         setNotice('Falha ao sincronizar. Confira sua conexão e as regras do Firestore.')
       })
     }
-  }, [workouts, history, user, cloudReady])
+  }, [workouts, history, user, cloudReady, canSyncCloud])
+
+  useEffect(() => {
+    restSecondsRef.current = restSeconds
+  }, [restSeconds])
 
   useEffect(() => {
     if (!timerRunning) return undefined
+    let remaining = restSecondsRef.current
     const interval = window.setInterval(() => {
-      setRestSeconds((seconds) => {
-        if (seconds <= 1) {
-          window.clearInterval(interval)
-          setTimerRunning(false)
-          if ('vibrate' in navigator) navigator.vibrate([250, 100, 250])
-          return 0
-        }
-        return seconds - 1
-      })
+      remaining -= 1
+      if (remaining <= 0) {
+        window.clearInterval(interval)
+        setRestSeconds(0)
+        setTimerRunning(false)
+        notifyRestComplete()
+        return
+      }
+      setRestSeconds(remaining)
     }, 1000)
     return () => window.clearInterval(interval)
   }, [timerRunning])
@@ -120,33 +205,51 @@ function App() {
     setActiveWorkoutId(workoutId)
     setSelectedWorkoutId(workoutId)
     setCompletedSets({})
+    setSessionLoads({})
     setSessionStarted(Date.now())
     setActivePage('session')
   }
 
   function markSet(exerciseId, setNumber, rest) {
     const setKey = `${exerciseId}-${setNumber}`
-    setCompletedSets((current) => ({ ...current, [setKey]: !current[setKey] }))
-    setRestDuration(rest)
-    setRestSeconds(rest)
-    setTimerRunning(true)
+    const markingDone = !completedSets[setKey]
+    setCompletedSets((current) => ({ ...current, [setKey]: markingDone }))
+    if (markingDone) {
+      setRestDuration(rest)
+      setRestSeconds(rest)
+      setTimerRunning(true)
+    }
   }
 
   function finishWorkout() {
     if (!activeWorkout) return
     const duration = Math.max(1, Math.round((Date.now() - sessionStarted) / 60000))
-    const volume = activeWorkout.exercises.reduce((total, exercise) => {
-      const load = Number.parseFloat(exercise.load) || 0
-      const reps = Number.parseInt(exercise.reps, 10) || 10
-      return total + load * reps * exercise.sets
-    }, 0)
+    const setRecords = activeWorkout.exercises.flatMap((exercise) => (
+      Array.from({ length: exercise.sets }, (_, index) => {
+        const key = `${exercise.id}-${index + 1}`
+        if (!completedSets[key]) return null
+        const load = sessionLoads[key] ?? exercise.load
+        const weight = Number.parseFloat(load) || 0
+        const reps = Number.parseInt(exercise.reps, 10) || 10
+        return {
+          exerciseId: exercise.id,
+          exerciseName: exercise.name,
+          setNumber: index + 1,
+          load,
+          reps,
+          volume: weight * reps,
+        }
+      }).filter(Boolean)
+    ))
+    const volume = setRecords.reduce((total, set) => total + set.volume, 0)
     const entry = {
       id: crypto.randomUUID(),
-      date: new Date().toISOString().slice(0, 10),
+      date: localDateString(),
       workoutName: activeWorkout.name,
       focus: activeWorkout.focus,
       duration,
       volume,
+      sets: setRecords,
       pain: '',
     }
     setHistory((current) => [entry, ...current])
@@ -193,9 +296,8 @@ function App() {
     event.preventDefault()
     setAiError('')
     setAiResult('')
-    const proxyUrl = import.meta.env.VITE_GEMINI_PROXY_URL
-    if (!proxyUrl) {
-      setAiError('Configure VITE_GEMINI_PROXY_URL para conectar uma função segura do Gemini. A chave da API não deve ficar no navegador.')
+    if (!isFirebaseConfigured) {
+      setAiError('Configure o Firebase no .env.local para ativar a geração segura de treinos com IA.')
       return
     }
     if (!aiInput.trim() && !aiImage) {
@@ -204,23 +306,17 @@ function App() {
     }
     setAiLoading(true)
     try {
-      const response = await fetch(proxyUrl, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          prompt: [
-            'Analise o treino enviado e proponha uma evolução segura de 6 a 12 semanas.',
-            'Responda em português com JSON: {"name":"Treino X","focus":"grupos musculares","exercises":[{"name":"exercício","muscle":"grupo","sets":3,"reps":"8-12","load":"carga sugerida","rest":90}]}',
-            'Não faça diagnóstico médico. Considere o histórico de dores informado e evite movimentos que provoquem desconforto.',
-            `Treino atual: ${aiInput || 'Veja a imagem anexada.'}`,
-            `Histórico de dores: ${history.filter((entry) => entry.pain).map((entry) => entry.pain).join('; ') || 'Nenhuma dor registrada.'}`,
-          ].join('\n'),
-          image: aiImage?.data ?? null,
-          mimeType: aiImage?.type ?? null,
-        }),
+      const result = await requestWorkoutGeneration({
+        prompt: [
+          'Analise o treino enviado e proponha uma evolução segura de 6 a 12 semanas.',
+          'Analise o nível e estime o volume semanal atual e proposto em séries. Responda em português com JSON: {"name":"Treino X","focus":"grupos musculares","level":"intermediário","durationWeeks":8,"weeklyVolume":12,"exercises":[{"name":"exercício","muscle":"grupo","sets":3,"reps":"8-12","load":"carga sugerida","rest":90}]}',
+          'Não faça diagnóstico médico. Considere o histórico de dores informado e evite movimentos que provoquem desconforto.',
+          `Treino atual: ${aiInput || 'Veja a imagem anexada.'}`,
+          `Histórico de dores: ${history.filter((entry) => entry.pain).map((entry) => entry.pain).join('; ') || 'Nenhuma dor registrada.'}`,
+        ].join('\n'),
+        image: aiImage?.data ?? null,
+        mimeType: aiImage?.type ?? null,
       })
-      if (!response.ok) throw new Error('O serviço de IA não respondeu. Tente novamente em instantes.')
-      const result = await response.json()
       const answer = result.workout ?? result
       const generated = typeof answer === 'string' ? JSON.parse(answer.replace(/```(?:json)?|```/g, '').trim()) : answer
       if (!generated?.exercises?.length) throw new Error('A resposta da IA não trouxe exercícios em um formato válido.')
@@ -228,8 +324,11 @@ function App() {
         id: `ai-${crypto.randomUUID()}`,
         name: generated.name || 'Novo ciclo',
         focus: generated.focus || 'Ciclo evolutivo',
+        level: generated.level || '',
+        durationWeeks: Math.min(12, Math.max(6, Math.round(Number(generated.durationWeeks) || 8))),
+        weeklyVolume: Number(generated.weeklyVolume) || generated.exercises.reduce((total, exercise) => total + (Number(exercise.sets) || 3), 0),
         color: 'lime',
-        duration: 'Novo ciclo',
+        duration: `${Math.min(12, Math.max(6, Math.round(Number(generated.durationWeeks) || 8)))} semanas`,
         exercises: generated.exercises.map((exercise, index) => ({
           id: `ai-ex-${index}-${crypto.randomUUID()}`,
           name: exercise.name || 'Exercício',
@@ -243,7 +342,7 @@ function App() {
       }
       setWorkouts((current) => [routine, ...current])
       setSelectedWorkoutId(routine.id)
-      setAiResult(`${routine.name} foi criado com ${routine.exercises.length} exercícios e adicionado às suas fichas.`)
+      setAiResult(`${routine.name} · nível ${routine.level || 'avaliado'} · ${routine.duration} · ${routine.weeklyVolume} séries semanais. Adicionado às suas fichas.`)
       setAiInput('')
       setAiImage(null)
     } catch (error) {
@@ -260,8 +359,12 @@ function App() {
       setAiError('Escolha um arquivo de imagem.')
       return
     }
-    if (file.size > 8 * 1024 * 1024) {
-      setAiError('A imagem deve ter no máximo 8 MB.')
+    if (!['image/jpeg', 'image/png', 'image/webp'].includes(file.type)) {
+      setAiError('Use uma imagem PNG, JPG ou WebP.')
+      return
+    }
+    if (file.size > 5 * 1024 * 1024) {
+      setAiError('A imagem deve ter no máximo 5 MB.')
       return
     }
     const data = await new Promise((resolve, reject) => {
@@ -293,11 +396,11 @@ function App() {
         <div className="workspace-label">TREINO</div>
         <nav className="side-nav" aria-label="Navegação principal">
           {navItems.map(({ id, label, icon: Icon }) => (
-            <button key={id} className={`nav-link ${activePage === id || (id === 'workouts' && activePage === 'session') ? 'active' : ''}`} onClick={() => setActivePage(id)}>
+            <button key={id} aria-label={label} className={`nav-link ${activePage === id || (id === 'workouts' && activePage === 'session') ? 'active' : ''}`} onClick={() => setActivePage(id)}>
               <Icon size={18} /><span>{label}</span>
             </button>
           ))}
-          <button className={`nav-link ${activePage === 'ai' ? 'active' : ''}`} onClick={() => setActivePage('ai')}>
+          <button className={`nav-link ${activePage === 'ai' ? 'active' : ''}`} aria-label="Coach IA" onClick={() => setActivePage('ai')}>
             <Sparkles size={18} /><span>Coach IA</span><span className="nav-new">NOVO</span>
           </button>
         </nav>
@@ -338,6 +441,7 @@ function App() {
             <Dashboard
               workouts={workouts}
               history={history}
+              currentDate={currentDate}
               completedCount={completedCount}
               latestWorkout={latestWorkout}
               onStart={startWorkout}
@@ -358,10 +462,12 @@ function App() {
             <SessionPage
               workout={activeWorkout}
               completedSets={completedSets}
+              sessionLoads={sessionLoads}
               restSeconds={restSeconds}
               restDuration={restDuration}
               timerRunning={timerRunning}
               onMarkSet={markSet}
+              onSetLoad={(key, load) => setSessionLoads((current) => ({ ...current, [key]: load }))}
               onToggleTimer={() => setTimerRunning((running) => !running)}
               onResetTimer={() => { setRestSeconds(restDuration); setTimerRunning(false) }}
               onChooseDuration={(seconds) => { setRestDuration(seconds); setRestSeconds(seconds); setTimerRunning(false) }}
@@ -369,7 +475,7 @@ function App() {
               onExit={() => setActivePage('workouts')}
             />
           )}
-          {activePage === 'progress' && <ProgressPage history={history} workouts={workouts} completedCount={completedCount} />}
+          {activePage === 'progress' && <ProgressPage history={history} workouts={workouts} currentDate={currentDate} />}
           {activePage === 'ai' && (
             <AiPage
               input={aiInput}
@@ -385,7 +491,7 @@ function App() {
             />
           )}
         </div>
-        <footer className="app-footer"><span>© 2026 Pulso · Feito para evoluir</span><span><span className={`sync-dot ${isFirebaseConfigured && user ? 'online' : ''}`} />{user ? (cloudReady ? 'Sincronizado' : 'Sincronizando…') : 'Modo local'}</span></footer>
+        <footer className="app-footer"><span>© 2026 Pulso · Feito para evoluir</span><span><span className={`sync-dot ${canSyncCloud ? 'online' : ''}`} />{user ? (cloudReady ? (canSyncCloud ? 'Sincronizado' : 'Sem sincronização') : 'Sincronizando…') : 'Modo local'}</span></footer>
       </main>
 
       {notice && <div className="toast"><CheckCircle2 size={18} />{notice}<button onClick={() => setNotice('')} aria-label="Fechar aviso"><X size={15} /></button></div>}
@@ -419,12 +525,24 @@ function App() {
   )
 }
 
-function Dashboard({ workouts, history, completedCount, latestWorkout, onStart, onNavigate }) {
-  const todayName = new Intl.DateTimeFormat('pt-BR', { weekday: 'long' }).format(new Date())
-  const dateLabel = new Intl.DateTimeFormat('pt-BR', { day: 'numeric', month: 'long', year: 'numeric' }).format(new Date())
+function Dashboard({ workouts, history, currentDate, completedCount, latestWorkout, onStart, onNavigate }) {
+  const dateLabel = new Intl.DateTimeFormat('pt-BR', { day: 'numeric', month: 'long', year: 'numeric' }).format(currentDate)
   const recommendation = workouts[0]
+  const durationMinutes = history.reduce((total, entry) => total + (entry.duration || 0), 0)
+  const totalVolume = history.reduce((total, entry) => total + (entry.volume || 0), 0)
+  const streak = getWorkoutStreak(history, currentDate)
+  const durationLabel = `${Math.floor(durationMinutes / 60)}h ${String(durationMinutes % 60).padStart(2, '0')}m`
   const weekDays = ['S', 'T', 'Q', 'Q', 'S', 'S', 'D']
-  const doneDays = [true, true, false, true, false, false, false]
+  const todayIndex = (currentDate.getDay() + 6) % 7
+  const weekStart = new Date(currentDate)
+  weekStart.setDate(currentDate.getDate() - todayIndex)
+  const weekStartDate = localDateString(weekStart)
+  const todayDate = localDateString(currentDate)
+  const weekHistory = history.filter((entry) => entry.date >= weekStartDate && entry.date <= todayDate)
+  const doneDates = new Set(weekHistory.map((entry) => entry.date))
+  const doneCount = weekHistory.length
+  const weeklyGoal = 4
+  const weeklyProgress = Math.min(100, Math.round((doneCount / weeklyGoal) * 100))
 
   return (
     <>
@@ -445,19 +563,19 @@ function Dashboard({ workouts, history, completedCount, latestWorkout, onStart, 
         </section>
         <section className="week-card card">
           <div className="card-heading"><div><span className="eyebrow">SEU RITMO</span><h3>Esta semana</h3></div><button className="icon-button subtle-button" aria-label="Ver evolução" onClick={() => onNavigate('progress')}><ArrowRight size={17} /></button></div>
-          <div className="week-days">{weekDays.map((day, index) => <div key={`${day}-${index}`} className={`week-day ${doneDays[index] ? 'done' : ''} ${index === 2 ? 'today' : ''}`}><span>{day}</span><b>{doneDays[index] ? <Check size={15} /> : index + 26}</b></div>)}</div>
-          <div className="week-summary"><span><span className="status-dot" />3 treinos concluídos</span><strong>75%</strong></div>
-          <div className="progress-track"><span style={{ width: '75%' }} /></div>
-          <p className="week-note">Faltam <strong>1 treino</strong> para sua meta semanal</p>
+          <div className="week-days">{weekDays.map((day, index) => { const date = new Date(weekStart); date.setDate(weekStart.getDate() + index); const isDone = doneDates.has(localDateString(date)); return <div key={`${day}-${index}`} className={`week-day ${isDone ? 'done' : ''} ${index === todayIndex ? 'today' : ''}`}><span>{day}</span><b>{isDone ? <Check size={15} /> : date.getDate()}</b></div> })}</div>
+          <div className="week-summary"><span><span className="status-dot" />{doneCount} {doneCount === 1 ? 'treino concluído' : 'treinos concluídos'}</span><strong>{weeklyProgress}%</strong></div>
+          <div className="progress-track"><span style={{ width: `${weeklyProgress}%` }} /></div>
+          <p className="week-note">Faltam <strong>{weeklyGoal - doneCount} {weeklyGoal - doneCount === 1 ? 'treino' : 'treinos'}</strong> para sua meta semanal</p>
         </section>
       </div>
 
       <div className="section-heading"><div><span className="eyebrow">SUA JORNADA</span><h2>Visão geral</h2></div><button className="text-button" onClick={() => onNavigate('progress')}>Ver evolução <ArrowRight size={16} /></button></div>
       <div className="stats-grid">
-        <StatCard icon={Dumbbell} label="Treinos concluídos" value={`${completedCount + 12}`} caption="+3 esta semana" tone="lime" />
-        <StatCard icon={Clock3} label="Tempo treinando" value="28h 40m" caption="no total" tone="blue" />
-        <StatCard icon={Flame} label="Sequência atual" value="4 dias" caption="Seu recorde: 9 dias" tone="orange" />
-        <StatCard icon={Trophy} label="Volume total" value="48.2k" caption="kg levantados" tone="purple" />
+        <StatCard icon={Dumbbell} label="Treinos no histórico" value={`${completedCount}`} caption={`+${weekHistory.length} esta semana`} tone="lime" />
+        <StatCard icon={Clock3} label="Tempo treinando" value={durationLabel} caption="no total" tone="blue" />
+        <StatCard icon={Flame} label="Sequência atual" value={`${streak.current} ${streak.current === 1 ? 'dia' : 'dias'}`} caption={`Seu recorde: ${streak.best} ${streak.best === 1 ? 'dia' : 'dias'}`} tone="orange" />
+        <StatCard icon={Trophy} label="Volume total" value={`${(totalVolume / 1000).toFixed(1)}k`} caption="kg movimentados" tone="purple" />
       </div>
 
       <div className="lower-grid">
@@ -476,7 +594,7 @@ function Dashboard({ workouts, history, completedCount, latestWorkout, onStart, 
           {latestWorkout ? (
             <>
               <div className="recent-info"><span className="recent-calendar"><CalendarDays size={18} /></span><div><strong>{latestWorkout.workoutName} <span>· {latestWorkout.focus}</span></strong><small>{formatDate(latestWorkout.date)} · {latestWorkout.duration} min</small></div></div>
-              <MiniChart />
+              <MiniChart history={history} />
               <div className="recent-bottom"><span>Volume da sessão</span><strong>{latestWorkout.volume.toLocaleString('pt-BR')} <small>kg</small></strong></div>
             </>
           ) : <p className="empty-copy">Finalize seu primeiro treino para acompanhar o progresso.</p>}
@@ -490,8 +608,18 @@ function StatCard({ icon: Icon, label, value, caption, tone }) {
   return <div className="stat-card card"><span className={`stat-icon ${tone}`}><Icon size={17} /></span><span className="stat-label">{label}</span><strong className="stat-value">{value}</strong><small className="stat-caption">{caption}</small></div>
 }
 
-function MiniChart() {
-  return <div className="mini-chart" aria-label="Gráfico de evolução de carga"><svg viewBox="0 0 360 70" preserveAspectRatio="none" role="img"><defs><linearGradient id="chartFill" x1="0" x2="0" y1="0" y2="1"><stop offset="0%" stopColor="#b6f347" stopOpacity=".22" /><stop offset="100%" stopColor="#b6f347" stopOpacity="0" /></linearGradient></defs><path d="M0 53 C25 49 34 57 58 45 S92 48 116 36 S151 43 178 29 S216 35 238 22 S277 29 302 13 S333 17 360 5 V70 H0Z" fill="url(#chartFill)" /><path d="M0 53 C25 49 34 57 58 45 S92 48 116 36 S151 43 178 29 S216 35 238 22 S277 29 302 13 S333 17 360 5" fill="none" stroke="#b6f347" strokeWidth="2.5" vectorEffect="non-scaling-stroke" /><circle cx="302" cy="13" r="3" fill="#b6f347" /></svg><div className="chart-labels"><span>18 OUT</span><span>20 OUT</span><span>22 OUT</span><span>25 OUT</span></div></div>
+function MiniChart({ history }) {
+  const entries = history.slice(0, 6).reverse()
+  const maxVolume = Math.max(...entries.map((entry) => entry.volume || 0), 1)
+  const points = entries.map((entry, index) => ({
+    x: entries.length === 1 ? 180 : (index / (entries.length - 1)) * 360,
+    y: 58 - ((entry.volume || 0) / maxVolume) * 48,
+  }))
+  const linePath = points.length > 1
+    ? points.map((point, index) => `${index ? 'L' : 'M'}${point.x} ${point.y}`).join(' ')
+    : 'M0 52 L360 52'
+  const areaPath = `${linePath} L360 70 L0 70Z`
+  return <div className="mini-chart" aria-label="Gráfico de volume das últimas sessões"><svg viewBox="0 0 360 70" preserveAspectRatio="none" role="img"><defs><linearGradient id="chartFill" x1="0" x2="0" y1="0" y2="1"><stop offset="0%" stopColor="#b6f347" stopOpacity=".22" /><stop offset="100%" stopColor="#b6f347" stopOpacity="0" /></linearGradient></defs><path d={areaPath} fill="url(#chartFill)" /><path d={linePath} fill="none" stroke="#b6f347" strokeWidth="2.5" vectorEffect="non-scaling-stroke" />{points.length > 0 && <circle cx={points[points.length - 1].x} cy={points[points.length - 1].y} r="3" fill="#b6f347" />}</svg><div className="chart-labels">{entries.map((entry) => <span key={entry.id}>{entry.date.slice(5).split('-').reverse().join('/')}</span>)}</div></div>
 }
 
 function WorkoutsPage({ workouts, selectedWorkout, onSelect, onStart, onUpdateLoad, onNavigate }) {
@@ -511,7 +639,7 @@ function WorkoutsPage({ workouts, selectedWorkout, onSelect, onStart, onUpdateLo
   )
 }
 
-function SessionPage({ workout, completedSets, restSeconds, restDuration, timerRunning, onMarkSet, onToggleTimer, onResetTimer, onChooseDuration, onFinish, onExit }) {
+function SessionPage({ workout, completedSets, sessionLoads, restSeconds, restDuration, timerRunning, onMarkSet, onSetLoad, onToggleTimer, onResetTimer, onChooseDuration, onFinish, onExit }) {
   const totalSets = workout.exercises.reduce((total, exercise) => total + exercise.sets, 0)
   const done = Object.values(completedSets).filter(Boolean).length
   const percent = totalSets ? Math.round((done / totalSets) * 100) : 0
@@ -523,23 +651,28 @@ function SessionPage({ workout, completedSets, restSeconds, restDuration, timerR
       <div className="session-top"><button className="back-button" onClick={onExit}><ArrowLeft size={17} />Sair do modo academia</button><span className="live-pill"><span />SESSÃO EM ANDAMENTO</span></div>
       <div className="session-heading"><div><span className="eyebrow">MODO ACADEMIA · {workout.name.toUpperCase()}</span><h1>{workout.focus}</h1><p>{done} de {totalSets} séries concluídas <span>·</span> {percent}%</p></div><button className="button button-lime finish-button" onClick={onFinish}><Check size={16} />Finalizar treino</button></div>
       <div className="session-progress"><span style={{ width: `${percent}%` }} /></div>
-      <div className="session-layout"><div className="session-exercises">{workout.exercises.map((exercise, index) => <article className="session-exercise card" key={exercise.id}><div className="session-exercise-head"><span className="exercise-number">{String(index + 1).padStart(2, '0')}</span><div><strong>{exercise.name}</strong><small>{exercise.muscle} · {exercise.load}</small></div><MoreHorizontal size={19} /></div><div className="set-grid">{Array.from({ length: exercise.sets }, (_, setIndex) => { const key = `${exercise.id}-${setIndex + 1}`; return <button key={key} className={`set-row ${completedSets[key] ? 'is-done' : ''}`} onClick={() => onMarkSet(exercise.id, setIndex + 1, exercise.rest)}><span className="set-number">SÉRIE {String(setIndex + 1).padStart(2, '0')}</span><span className="set-reps">{exercise.reps} reps</span><span className="set-load">{exercise.load}</span><span className="set-check">{completedSets[key] ? <Check size={15} /> : <Plus size={15} />}</span></button> })}</div></article>)}</div>
+      <div className="session-layout"><div className="session-exercises">{workout.exercises.map((exercise, index) => <article className="session-exercise card" key={exercise.id}><div className="session-exercise-head"><span className="exercise-number">{String(index + 1).padStart(2, '0')}</span><div><strong>{exercise.name}</strong><small>{exercise.muscle} · {exercise.load}</small></div><MoreHorizontal size={19} /></div><div className="set-grid">{Array.from({ length: exercise.sets }, (_, setIndex) => { const key = `${exercise.id}-${setIndex + 1}`; const isDone = Boolean(completedSets[key]); return <div key={key} className={`set-row ${isDone ? 'is-done' : ''}`}><span className="set-number">SÉRIE {String(setIndex + 1).padStart(2, '0')}</span><span className="set-reps">{exercise.reps} reps</span><label className="set-load-control"><input aria-label={`Carga da série ${setIndex + 1} — ${exercise.name}`} value={sessionLoads[key] ?? exercise.load} onChange={(event) => onSetLoad(key, event.target.value)} /><span>kg</span></label><button type="button" className="set-check" aria-label={`${isDone ? 'Desmarcar' : 'Marcar'} série ${setIndex + 1} — ${exercise.name}`} onClick={() => onMarkSet(exercise.id, setIndex + 1, exercise.rest)}>{isDone ? <Check size={15} /> : <Plus size={15} />}</button></div> })}</div></article>)}</div>
         <aside className="timer-card card"><div className="timer-header"><span className="eyebrow">DESCANSO</span><Timer size={18} /></div><div className="timer-ring" style={{ '--timer-progress': `${restDuration ? ((restDuration - restSeconds) / restDuration) * 100 : 0}%` }}><div><strong>{mm}:{ss}</strong><span>{restSeconds > 0 ? 'RECUPERANDO' : 'PRONTO?'}</span></div></div><div className="timer-controls"><button className="timer-control primary" onClick={onToggleTimer} aria-label={timerRunning ? 'Pausar cronômetro' : 'Iniciar cronômetro'}>{timerRunning ? <Pause size={18} /> : <Play size={18} fill="currentColor" />}</button><button className="timer-control" onClick={onResetTimer} aria-label="Reiniciar cronômetro"><History size={17} /></button></div><div className="timer-presets">{[60, 90, 120].map((seconds) => <button key={seconds} className={restDuration === seconds ? 'selected' : ''} onClick={() => onChooseDuration(seconds)}>{seconds < 60 ? `${seconds}s` : `${seconds / 60}m`}</button>)}</div><p className="timer-tip"><Zap size={14} />Respire fundo. Seu próximo set começa quando você estiver pronto.</p><div className="session-summary"><span>Progresso da sessão</span><strong>{done}/{totalSets}</strong><div className="progress-track"><span style={{ width: `${percent}%` }} /></div></div></aside>
       </div>
     </div>
   )
 }
 
-function ProgressPage({ history, workouts, completedCount }) {
+function ProgressPage({ history, workouts, currentDate }) {
   const sessions = history.filter((entry) => !entry.id.startsWith('sample-'))
   const totalVolume = history.reduce((total, entry) => total + (entry.volume || 0), 0)
   const painEntries = history.filter((entry) => entry.pain)
-  const barValues = [45, 59, 52, 72, 66, 84, 76, 94]
+  const chartEntries = history.slice(0, 8).reverse()
+  const chartMax = Math.max(...chartEntries.map((entry) => entry.volume || 0), 1)
+  const previousVolume = history[1]?.volume
+  const volumeChange = previousVolume ? Math.round(((history[0].volume - previousVolume) / previousVolume) * 100) : null
+  const chartLabels = [1, 0.75, 0.5, 0.25].map((fraction) => `${Math.round((chartMax * fraction) / 100) / 10}k`)
+  const streak = getWorkoutStreak(history, currentDate)
   return (
     <>
       <div className="welcome-row page-title-row"><div><div className="eyebrow"><span className="eyebrow-line" />DADOS DA SUA JORNADA</div><h1>Sua evolução</h1><p className="page-lead">Cada repetição conta. Olha só o que você já construiu.</p></div><div className="period-select"><CalendarDays size={16} />Últimos 30 dias<ChevronDown size={15} /></div></div>
-      <div className="progress-stats"><StatCard icon={Dumbbell} label="Treinos registrados" value={`${sessions.length}`} caption={`${completedCount} concluídos por você`} tone="lime" /><StatCard icon={Activity} label="Volume acumulado" value={`${(totalVolume / 1000).toFixed(1)}k`} caption="kg movimentados" tone="blue" /><StatCard icon={Flame} label="Maior sequência" value="9 dias" caption="Seu recorde pessoal" tone="orange" /></div>
-      <div className="progress-layout"><section className="card volume-card"><div className="card-heading"><div><span className="eyebrow">FORÇA AO LONGO DO TEMPO</span><h3>Evolução de carga</h3></div><span className="trend-chip"><TrendingUp size={14} />+12,8%</span></div><div className="large-chart"><div className="chart-y-labels"><span>80 kg</span><span>60 kg</span><span>40 kg</span><span>20 kg</span></div><div className="bar-chart">{barValues.map((value, index) => <div className="bar-column" key={index}><div className="bar-track"><span style={{ height: `${value}%` }} /></div><small>{['01 OUT', '05 OUT', '09 OUT', '13 OUT', '17 OUT', '21 OUT', '25 OUT', 'HOJE'][index]}</small></div>)}</div></div><div className="chart-legend"><span /> Volume total por semana <span className="legend-note">Atualizado com seus treinos</span></div></section>
+      <div className="progress-stats"><StatCard icon={Dumbbell} label="Treinos registrados" value={`${sessions.length}`} caption={`${sessions.length} concluídos por você`} tone="lime" /><StatCard icon={Activity} label="Volume acumulado" value={`${(totalVolume / 1000).toFixed(1)}k`} caption="kg movimentados" tone="blue" /><StatCard icon={Flame} label="Maior sequência" value={`${streak.best} dias`} caption="calculado pelo histórico" tone="orange" /></div>
+      <div className="progress-layout"><section className="card volume-card"><div className="card-heading"><div><span className="eyebrow">CARGA REGISTRADA EM CADA SÉRIE</span><h3>Volume por sessão</h3></div><span className="trend-chip"><TrendingUp size={14} />{volumeChange === null ? '—' : `${volumeChange > 0 ? '+' : ''}${volumeChange}%`}</span></div><div className="large-chart"><div className="chart-y-labels">{chartLabels.map((label, index) => <span key={index}>{label}</span>)}</div><div className="bar-chart">{chartEntries.map((entry) => <div className="bar-column" key={entry.id}><div className="bar-track"><span style={{ height: `${Math.max(4, ((entry.volume || 0) / chartMax) * 100)}%` }} /></div><small>{entry.date.slice(5).split('-').reverse().join('/')}</small></div>)}</div></div><div className="chart-legend"><span /> Volume movimentado por sessão (kg) <span className="legend-note">Calculado com suas séries concluídas</span></div></section>
         <section className="card pain-card"><div className="card-heading"><div><span className="eyebrow">ATENÇÃO AO CORPO</span><h3>Feedback de dores</h3></div><HeartPulse size={18} className="pain-head-icon" /></div>{painEntries.length ? painEntries.slice(0, 3).map((entry) => <div className="pain-entry" key={entry.id}><span className="pain-entry-icon"><HeartPulse size={16} /></span><div><strong>{entry.pain}</strong><small>{entry.workoutName} · {formatDate(entry.date)}</small></div></div>) : <div className="pain-empty"><span><CheckCircle2 size={20} /></span><strong>Nenhum incômodo registrado</strong><small>Continue ouvindo seu corpo durante os treinos.</small></div>}<div className="safety-note"><CircleHelp size={15} /><span>Esses relatos ajudam a IA a sugerir alternativas. Consulte um profissional para avaliação de dores persistentes.</span></div></section></div>
       <section className="card history-card"><div className="card-heading"><div><span className="eyebrow">ATIVIDADE</span><h3>Histórico de treinos</h3></div><span className="count-pill">{history.length} sessões</span></div><div className="history-table"><div className="history-head"><span>SESSÃO</span><span>DATA</span><span>DURAÇÃO</span><span>VOLUME</span><span>FEEDBACK</span></div>{history.map((entry) => <div className="history-row" key={entry.id}><div className="history-session"><span className={`history-icon ${workouts.find((workout) => workout.name === entry.workoutName)?.color ?? 'lime'}`}><Dumbbell size={16} /></span><span><strong>{entry.workoutName}</strong><small>{entry.focus}</small></span></div><span>{formatDate(entry.date)}</span><span>{entry.duration} min</span><strong>{entry.volume.toLocaleString('pt-BR')} kg</strong><span className={`feedback-status ${entry.pain ? 'pain' : ''}`}>{entry.pain ? <><HeartPulse size={14} />Registrado</> : <><CheckCircle2 size={14} />Sem dores</>}</span></div>)}</div></section>
     </>
@@ -550,7 +683,7 @@ function AiPage({ input, image, loading, error, result, onInput, onImage, onRemo
   return (
     <>
       <div className="welcome-row page-title-row"><div><div className="eyebrow"><span className="eyebrow-line" />INTELIGÊNCIA A FAVOR DO SEU PROGRESSO</div><h1>Seu próximo ciclo começa aqui<span className="lime-dot">.</span></h1><p className="page-lead">A IA analisa seu treino atual e ajuda a montar um novo ciclo para você.</p></div><span className="ai-orb"><Sparkles size={24} /></span></div>
-      <div className="ai-layout"><section className="ai-form-card card"><div className="ai-card-title"><span className="ai-icon"><Sparkles size={18} /></span><div><strong>Monte seu novo ciclo</strong><small>Envie seu treino atual para começar</small></div></div><form onSubmit={onSubmit}><label className="field-label">Cole o texto do seu treino<textarea className="input textarea ai-textarea" value={input} onChange={(event) => onInput(event.target.value)} placeholder={'Ex.: Treino A — Peito e tríceps\nSupino reto: 4 séries de 8–10 reps, 40 kg\nTríceps corda: 3 séries de 12 reps, 25 kg'} rows={8} /></label><div className="upload-divider"><span>ou envie uma foto</span></div><label className={`upload-box ${image ? 'has-file' : ''}`}><input type="file" accept="image/*" onChange={onImage} /><span className="upload-icon"><FileImage size={20} /></span><span><strong>{image?.name || 'Clique para enviar uma imagem'}</strong><small>{image ? 'Imagem pronta para análise' : 'PNG ou JPG · até 8 MB'}</small></span>{image ? <button className="remove-file" type="button" onClick={(event) => { event.preventDefault(); onRemoveImage() }} aria-label="Remover imagem"><X size={16} /></button> : <Upload size={18} className="upload-arrow" />}</label><div className="ai-hint"><HeartPulse size={16} /><span>Vamos considerar os relatos de dor registrados no seu histórico e sugerir alternativas.</span></div>{error && <p className="form-error">{error}</p>}{result && <p className="form-success"><CheckCircle2 size={16} />{result}</p>}<div className="ai-actions"><button className="button button-quiet" type="button" onClick={onClear}>Limpar</button><button className="button button-primary" type="submit" disabled={loading}>{loading ? <span className="spinner" /> : <Sparkles size={16} />}{loading ? 'Analisando...' : 'Gerar novo ciclo'}<ArrowRight size={16} /></button></div></form></section>
+      <div className="ai-layout"><section className="ai-form-card card"><div className="ai-card-title"><span className="ai-icon"><Sparkles size={18} /></span><div><strong>Monte seu novo ciclo</strong><small>Envie seu treino atual para começar</small></div></div><form onSubmit={onSubmit}><label className="field-label">Cole o texto do seu treino<textarea className="input textarea ai-textarea" value={input} onChange={(event) => onInput(event.target.value)} placeholder={'Ex.: Treino A — Peito e tríceps\nSupino reto: 4 séries de 8–10 reps, 40 kg\nTríceps corda: 3 séries de 12 reps, 25 kg'} rows={8} /></label><div className="upload-divider"><span>ou envie uma foto</span></div><label className={`upload-box ${image ? 'has-file' : ''}`}>      <input type="file" accept="image/*" onChange={onImage} /><span className="upload-icon"><FileImage size={20} /></span><span><strong>{image?.name || 'Clique para enviar uma imagem'}</strong><small>{image ? 'Imagem pronta para análise' : 'PNG, JPG ou WebP · até 5 MB'}</small></span>{image ? <button className="remove-file" type="button" onClick={(event) => { event.preventDefault(); onRemoveImage() }} aria-label="Remover imagem"><X size={16} /></button> : <Upload size={18} className="upload-arrow" />}</label><div className="ai-hint"><HeartPulse size={16} /><span>Vamos considerar os relatos de dor registrados no seu histórico e sugerir alternativas.</span></div>{error && <p className="form-error">{error}</p>}{result && <p className="form-success"><CheckCircle2 size={16} />{result}</p>}<div className="ai-actions"><button className="button button-quiet" type="button" onClick={onClear}>Limpar</button><button className="button button-primary" type="submit" disabled={loading}>{loading ? <span className="spinner" /> : <Sparkles size={16} />}{loading ? 'Analisando...' : 'Gerar novo ciclo'}<ArrowRight size={16} /></button></div></form></section>
         <aside className="ai-side"><section className="card how-card"><span className="eyebrow">COMO FUNCIONA</span><h3>Um ciclo pensado para você.</h3><div className="steps-list"><div className="ai-step"><span>01</span><div><strong>Compartilhe seu treino</strong><small>Texto ou foto da ficha atual.</small></div></div><div className="ai-step"><span>02</span><div><strong>A IA analisa seu contexto</strong><small>Volume, nível e histórico de dores.</small></div></div><div className="ai-step"><span>03</span><div><strong>Receba uma nova proposta</strong><small>Um ciclo progressivo de 6 a 12 semanas.</small></div></div></div></section><section className="safe-card"><div className="safe-icon"><HeartPulse size={18} /></div><div><strong>Treino com responsabilidade</strong><p>A IA oferece sugestões gerais, não substitui orientação profissional. Ajuste o treino se sentir desconforto.</p></div></section><div className="privacy-note ai-privacy"><span className="sync-dot" />Sua imagem será enviada apenas ao serviço de IA configurado no seu projeto.</div></aside></div>
     </>
   )

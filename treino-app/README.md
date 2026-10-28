@@ -1,16 +1,54 @@
-# React + Vite
+# Pulso — treinos no seu ritmo
 
-This template provides a minimal setup to get React working in Vite with HMR and some Oxlint rules.
+WebApp responsivo para organizar fichas de musculação, acompanhar cargas e registrar feedback após cada sessão. O modo local funciona sem configuração; Firebase habilita contas e sincronização, e uma Cloud Function consulta o Gemini sem expor a chave da API no navegador.
 
-Currently, two official plugins are available:
+## Rodar localmente
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Oxc](https://oxc.rs)
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/)
+Requer Node.js 22 ou superior.
 
-## React Compiler
+```bash
+npm install
+cp .env.example .env.local
+npm run dev
+```
 
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
+Sem credenciais, a aplicação usa dados demonstrativos salvos apenas neste navegador. Para ativar login e sincronização, preencha `.env.local` com as credenciais do app Web do Firebase.
 
-## Expanding the Oxlint configuration
+## Configurar Firebase e Gemini
 
-If you are developing a production application, we recommend using TypeScript with type-aware lint rules enabled. Check out the [TS template](https://github.com/vitejs/vite/tree/main/packages/create-vite/template-react-ts) for information on how to integrate TypeScript and Oxlint's TypeScript related rules in your project.
+1. Crie um projeto no Firebase e registre um app Web.
+2. Em **Authentication**, habilite os provedores E-mail/senha e Google.
+3. Crie o banco Firestore em modo de produção.
+4. Copie os valores da configuração Web para `.env.local`:
+   - `VITE_FIREBASE_API_KEY`
+   - `VITE_FIREBASE_AUTH_DOMAIN`
+   - `VITE_FIREBASE_PROJECT_ID`
+   - `VITE_FIREBASE_APP_ID`
+5. Instale e autentique a Firebase CLI, selecione o projeto e configure a chave do Gemini como Secret Manager:
+
+   ```bash
+   npm install --global firebase-tools
+   firebase login
+   firebase use --add
+   firebase functions:secrets:set GEMINI_API_KEY
+   ```
+
+6. Instale as dependências da função e publique regras e função:
+
+   ```bash
+   cd functions
+   npm install
+   cd ..
+   firebase deploy --only firestore:rules,functions
+   ```
+
+A função `generateWorkout` exige usuário autenticado, valida o tamanho e o tipo de imagem e chama o Gemini no servidor. A chave `GEMINI_API_KEY` fica no Secret Manager; nunca a coloque em variáveis `VITE_*`. A geração de ciclos usa a região `southamerica-east1`.
+
+As regras em `firestore.rules` limitam cada usuário ao próprio documento em `users/{uid}`. Não use regras abertas em produção. A configuração de Auth, Firestore, Functions e Gemini pode gerar custos conforme o uso e os limites dos respectivos serviços.
+
+## Comandos
+
+- `npm run dev` — servidor local
+- `npm run lint` — análise estática da aplicação
+- `npm run build` — build de produção
+- `cd functions && npm run lint` — análise estática da Cloud Function
